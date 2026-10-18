@@ -13,7 +13,7 @@ OpsPulse is a multi-tenant engineering runbook and incident triage engine: a pro
 3. **No fixed-character chunking.** Split by document structure: headings and paragraphs. Code blocks and tables stay intact. The only exception is the naive-baseline ablation variant (see below), which exists solely to be benchmarked against.
 4. **Structured output with verifiable citations.** The LLM returns a Pydantic-validated schema: `answer`, `citations` (a list of `{chunk_id, source_file}`) and `confidence_score`. Every factual claim cites a retrieved `chunk_id`, and a code-side validator rejects any cited `chunk_id` that was not among the chunks sent in that request.
 5. **Deterministic refusal.** If the top reranker score is below the threshold, or the context does not contain the answer, return exactly `"Insufficient evidence in the knowledge base"`. Do not let the LLM guess.
-6. **No pipeline tweaks without a benchmark run.** Once the baseline exists, any change to chunk sizes, prompts, embedding model, thresholds or retrieval logic requires running the eval CLI and logging before/after metrics.
+6. **No pipeline tweaks without a benchmark run.** Once the baseline exists, any change to chunk sizes, prompts or embedding model requires running the eval CLI and logging before/after metrics. (Project extension: the same applies to thresholds and retrieval logic.)
 
 ## Stack
 
@@ -41,23 +41,30 @@ upload → SHA-256 of the content → **no-op if the hash is unchanged** → enq
 - Chunker: splits on `#`/`##`/`###`; chunks are **250–600 tokens** with **10–15% token overlap** between sequential chunks in the same section; code blocks are never split.
 - Chunk metadata (JSONB): heading hierarchy (H1 → H2 → H3), `source_file`, `updated_at`, `access_role`.
 - Contextual Retrieval: send the whole document (prompt-cached) plus the chunk to a cheap LLM, which writes a 1–2 sentence context header explaining which document and system the chunk belongs to. That header is prepended to the chunk before embedding *and* before keyword indexing.
-- Chunk table columns: raw text, contextualized text, JSONB metadata (GIN index), vector (HNSW index), tsvector (GIN index).
+- Chunk table columns: raw text, contextualized text, JSONB metadata (GIN index), vector (HNSW index), tsvector (the GIN index on it is our pick; the spec only requires the column).
 
 ### Query pipeline
-chat history + message → **query rewriter** (standalone, search-optimized query) → **vector top-25** and **full-text top-25**, both RBAC-filtered in SQL → **RRF** merge with `score(d) = Σ 1/(60 + rank_m(d))` → **cross-encoder rerank** of the top-25 → keep the **top-5 above the threshold**, otherwise refuse → prompt with chunks wrapped in `<document id="chunk_42" source="runbook.md">…</document>` tags (untrusted data kept separate from instructions) → structured output → citation validator → trace.
+chat history + message → **query rewriter** (standalone, search-optimized query) → **vector (cosine) top-25** and **full-text top-25**, both RBAC-filtered in SQL → **RRF** merge with `score(d) = Σ 1/(60 + rank_m(d))` → **cross-encoder rerank** of the top-25 → keep the **top-5 above the threshold**, otherwise refuse → prompt with chunks wrapped in `<document id="chunk_42" source="runbook.md">…</document>` tags (untrusted data kept separate from instructions) → structured output → citation validator → trace.
 
 - The retrieval service takes `(query, user_role)`.
 - Candidate count: the spec's comparison table says "Top-30 candidates", but its detailed steps say top-25 per retriever and top-25 merged into the reranker. We follow the detailed steps (25).
 - The citation validator checks every cited `chunk_id` against the (up to) 5 chunks actually sent in that request.
 - Every query logs a trace with: original query, rewritten query, retrieved chunk IDs + RRF scores, reranker scores, prompt/completion tokens, cost in USD, and per-stage latency (retrieval ms, rerank ms, LLM TTFT).
 
+### Spec gaps / project decisions
+- **Role visibility:** the spec doesn't say whether roles are hierarchical. We treat them as hierarchical (`admin` ⊇ `engineer` ⊇ `public`), enforced in SQL as `access_role = ANY(<roles allowed for user_role>)`.
+- **"Multi-tenant":** this appears only in the spec's title. The spec's details only define RBAC roles, so a `tenant_id` is not required unless we decide to add one.
+- **Architecture diagram:** the spec mentions an "interactive architecture diagram below", but the PDF doesn't include one. The README diagram is ours to design.
+
 ## Build order and evaluation
 
-1. **Eval harness first.** Build a corpus of 20–30 technical docs (Kubernetes/Postgres runbooks, synthetic post-mortems with error codes such as `ERR-4523` and `INC-8842`, CLI flags and tables). Write a 30-case golden dataset JSON with `question`, `expected_answer`, `expected_source_docs` and `user_role`. Include exact-code queries (e.g. "OOMKilled exit code 137"), multi-hop questions across two files, unanswerable questions (to test refusal) and RBAC cases.
-2. The eval CLI runs the pipeline over all 30 questions and scores **Context Recall**, **Context Precision** and **Faithfulness** with an LLM-as-judge. It must also run as an automated CI evaluation suite, not just locally.
-3. Then build, in order: async ingestion + chunking → hybrid search + RBAC → query rewriting + reranking → constrained generation + observability.
+The steps below follow the spec's roadmap numbering.
 
-After step 4 (reranking), run the eval comparing vector-only against hybrid + reranking and record the Context Precision/Recall gain in the README.
+1. **Corpus + eval harness first.** Build a corpus of 20–30 technical docs: Kubernetes/Postgres runbooks and realistic synthetic post-mortems with specific error codes (e.g. `ERR-4523`), ticket IDs (e.g. `INC-8842`), CLI flags and architecture tables. Write a 30-case golden dataset JSON with `question`, `expected_answer`, `expected_source_docs` and `user_role`. Include exact-code queries (e.g. "OOMKilled exit code 137"), multi-hop questions across two files, and unanswerable questions (to test refusal). Adding RBAC test cases is a project extension. The eval CLI runs the pipeline over all 30 questions and scores **Context Recall**, **Context Precision** and **Faithfulness** with an LLM-as-judge. It must also run as an automated CI evaluation suite, not just locally.
+2. **Async ingestion + structure-aware/contextual chunking.**
+3. **Hybrid search + RBAC.**
+4. **Query rewriting + cross-encoder reranking.** Then run the eval comparing vector-only against hybrid + reranking, and record the Context Precision/Recall gain in the README.
+5. **Constrained generation, citations + observability.**
 
 The README is structured around engineering trade-offs and measured metrics. It must include an architecture diagram of both pipelines (async ingestion and multi-stage query), a **4-row ablation table** of real 30-question eval scores, and a latency/cost profile: **p50/p95 latency + average cost per 1,000 queries**, including the input-token savings of retrieving 25 and reranking to 5 versus stuffing 20 raw chunks into the prompt. The ablation rows are:
 1. naive baseline (fixed chunks, vector only)
