@@ -25,10 +25,12 @@ The spec leaves most tooling open (e.g. pgvector *or* Qdrant, Cohere Rerank *or*
 - Procrastinate (Postgres-backed job queue) for async ingestion
 - Docling for converting PDFs to Markdown; custom converters for JSON/CSV tickets
 - `tiktoken` for token counting in the chunker
-- Anthropic SDK: Haiku for contextual enrichment (with prompt caching) and query rewriting, Sonnet for answer generation
-- OpenAI `text-embedding-3-small` for embeddings (Anthropic has no embeddings API)
-- `BAAI/bge-reranker-v2-m3` cross-encoder, run locally via sentence-transformers
-- Pydantic + Instructor (or native tool-use JSON schema) for structured outputs with retries
+- **Fully local models by default, no API keys.** Ollama runs natively on macOS (not in Docker, so it gets the Metal GPU) and is called through the official `ollama` Python SDK. No LangChain/LlamaIndex wrappers.
+- One local instruct model handles answer generation, query rewriting, contextual enrichment and the eval judge. The default is `gemma4:latest` (~9.6 GB; the official build, not community fine-tunes). It is configurable via `LLM_MODEL`; `LLM_MODEL_CI` sets a smaller model for CI.
+- Embeddings: `bge-m3` via Ollama (1024-dim, so the column is `vector(1024)`), configurable via `EMBED_MODEL`. Changing the embedding model means re-ingesting and an eval run (rule 6). Why `bge-m3`: it is one of the two most-used open-weight embedding models (with Qwen3-Embedding), its 8K-token context fits 600-token chunks plus the context header, and it is small enough to share 16 GB of RAM with the LLM. Rejected: `mxbai-embed-large` (512-token limit truncates chunks). Candidates to benchmark later: `qwen3-embedding:0.6b` (can output 1024 dimensions, so no schema change; scores higher on benchmarks) and `embeddinggemma` (smaller, the fallback if RAM swaps; 768-dim and needs query/document prompt prefixes added in `embed()`).
+- `BAAI/bge-reranker-v2-m3` cross-encoder, run locally via sentence-transformers on the `mps` device
+- Structured output: Ollama's `format=<JSON schema>` (generated from the Pydantic model), validated with Pydantic, plus our own small retry loop on schema or citation failure. No Instructor. Disable thinking mode for structured calls: with Gemma 4 thinking on, the JSON can land in the reasoning field instead of the content. Keep the schema flat (small models are reported to break on schemas nested 3+ levels deep).
+- **Thin model layer:** every LLM and embedding call goes through one module (e.g. `opspulse/llm.py` with `complete()`, `complete_structured()`, `embed()`). Pipeline code never imports `ollama` directly, so swapping the backend (e.g. for the judge only) is a one-file change. The layer supports `LLM_BACKEND=ollama|openai|anthropic` (default `ollama`). Hosted backends are optional and read their API key from `.env` only when selected, so the default setup still needs no keys. This mirrors how production teams swap providers; benchmark any non-default backend before reporting its numbers (rule 6).
 - RAGAS-style metrics in a custom eval CLI; Langfuse (self-hosted) plus a structured JSON trace log for observability
 
 Known caveat: Postgres `ts_rank_cd` full-text ranking is not true BM25. Document this trade-off, or switch to ParadeDB `pg_search` if the benchmark shows it matters.
@@ -40,7 +42,7 @@ upload → SHA-256 of the content → **no-op if the hash is unchanged** → enq
 
 - Chunker: splits on `#`/`##`/`###`; chunks are **250–600 tokens** with **10–15% token overlap** between sequential chunks in the same section; code blocks are never split.
 - Chunk metadata (JSONB): heading hierarchy (H1 → H2 → H3), `source_file`, `updated_at`, `access_role`.
-- Contextual Retrieval: send the whole document (prompt-cached) plus the chunk to a cheap LLM, which writes a 1–2 sentence context header explaining which document and system the chunk belongs to. That header is prepended to the chunk before embedding *and* before keyword indexing.
+- Contextual Retrieval: send the whole document (placed first in the prompt so its KV cache is reused; see "Prompt caching" below) plus the chunk to the local LLM, which writes a 1–2 sentence context header explaining which document and system the chunk belongs to. That header is prepended to the chunk before embedding *and* before keyword indexing.
 - Chunk table columns: raw text, contextualized text, JSONB metadata (GIN index), vector (HNSW index), tsvector (the GIN index on it is our pick; the spec only requires the column).
 
 ### Query pipeline
@@ -55,6 +57,11 @@ chat history + message → **query rewriter** (standalone, search-optimized quer
 - **Role visibility:** the spec doesn't say whether roles are hierarchical. We treat them as hierarchical (`admin` ⊇ `engineer` ⊇ `public`), enforced in SQL as `access_role = ANY(<roles allowed for user_role>)`.
 - **"Multi-tenant":** this appears only in the spec's title. The spec's details only define RBAC roles, so a `tenant_id` is not required unless we decide to add one.
 - **Architecture diagram:** the spec mentions an "interactive architecture diagram below", but the PDF doesn't include one. The README diagram is ours to design.
+- **Local models:** we use Ollama instead of hosted APIs. The spec explicitly allows "local Ollama SDKs".
+- **Prompt caching:** the spec's "prompt caching to keep costs tiny" assumes a paid API. Locally the API cost is $0. The enrichment prompt puts the full document first and the chunk last, so Ollama can reuse the KV cache for that prefix across chunks of the same document. The README documents the trade-off (slower ingestion than a hosted API).
+- **"Cost in USD":** traces record prompt/completion token counts and API cost = $0. The README cost profile also shows an *estimated equivalent* hosted-API cost per 1,000 queries, derived from token counts, so the "retrieve 25 → rerank to 5 vs. stuff 20 chunks" token-savings comparison still holds.
+- **Judge reliability:** a small local judge is noisy. If eval scores look unstable, only the judge may be pointed at a stronger backend through the model layer. Every eval run records which judge model produced it.
+- **CI eval:** GitHub runners have no GPU, so CI uses `LLM_MODEL_CI` (a smaller model) and/or a subset of the golden set. The full 30-question run is done locally and its results are committed.
 
 ## Build order and evaluation
 
@@ -73,6 +80,19 @@ The README is structured around engineering trade-offs and measured metrics. It 
 4. + reranking
 
 So the naive baseline must stay runnable as a configurable pipeline variant.
+
+The README also has a short "Why these choices" section covering the stack trade-offs: `bge-m3` vs. Qwen3-Embedding vs. hosted embeddings, local vs. hosted LLM (and the `LLM_BACKEND` switch), self-hosted vs. Cohere reranking, and `ts_rank_cd` vs. true BM25.
+
+## Prerequisites
+
+Target machine: Apple Silicon Mac (M4, 16 GB RAM).
+
+- Docker Desktop, running (Postgres 16 + pgvector; later Langfuse)
+- `uv` (`brew install uv`), which installs Python 3.12. Do not use the system Python 3.9.
+- Ollama (`brew install ollama`), then `ollama pull gemma4` and `ollama pull bge-m3`
+- About 10 GB free disk space for models, Docker images and packages. The reranker and Docling weights download on first use.
+- RAM is tight on 16 GB: Gemma 4 (~9.6 GB) + reranker (~2 GB) + Postgres. Cap Docker Desktop's memory at ~4 GB and close other heavy apps during eval runs. If it swaps, fall back to a smaller `LLM_MODEL` (e.g. `qwen3:8b`, ~5 GB) and benchmark the switch.
+- No API keys for the default setup. `.env` holds `DATABASE_URL`, `OLLAMA_HOST`, `LLM_BACKEND`, `LLM_MODEL` and `EMBED_MODEL`, plus `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` only if a hosted backend is selected.
 
 ## Commands
 
